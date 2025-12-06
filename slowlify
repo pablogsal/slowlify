@@ -1,0 +1,778 @@
+#!/bin/bash
+#
+# slowlify - Simulate a slow/overloaded machine for reproducing CI failures
+#
+# Usage: sudo ./slowlify [OPTIONS] -- <command> [args...]
+#
+# Examples:
+#   sudo ./slowlify -- ./my_test
+#   sudo ./slowlify -c 10 -m 128M -- make test
+#   sudo ./slowlify -c 5 --strace "open:100000" -- ./race_test
+#   sudo ./slowlify --stress -- pytest tests/
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration defaults
+# ============================================================================
+
+CPU_PERCENT=20              # CPU quota percentage (1-100)
+MEMORY_LIMIT="256M"         # Hard memory limit
+MEMORY_HIGH=""              # Soft limit (triggers reclaim pressure)
+CPU_CORES="0"               # CPU cores to pin to (e.g., "0" or "0,1")
+NICE_LEVEL=19               # Nice level (higher = lower priority)
+IONICE_CLASS=3              # I/O scheduling class (3 = idle)
+USE_IDLE_SCHED=false        # Use SCHED_IDLE scheduler
+STRACE_INJECT=""            # strace delay injection spec
+STRESS_ENABLED=false        # Run stress-ng in background
+STRESS_LOAD=80              # stress-ng CPU load percentage
+REPEAT=1                    # Repeat command N times
+VERBOSE=false
+PROFILE=""                  # Preset profile name
+
+# ============================================================================
+# Preset profiles
+# ============================================================================
+
+apply_profile() {
+    local profile="$1"
+    
+    case "$profile" in
+        slow)
+            # Moderately slow - like a budget CI runner
+            CPU_PERCENT=25
+            MEMORY_LIMIT="256M"
+            CPU_CORES="0"
+            NICE_LEVEL=15
+            ;;
+        crawl)
+            # Very slow - ancient hardware simulation
+            CPU_PERCENT=5
+            MEMORY_LIMIT="128M"
+            CPU_CORES="0"
+            NICE_LEVEL=19
+            IONICE_CLASS=3
+            USE_IDLE_SCHED=true
+            ;;
+        ci|ci-slow)
+            # Simulates overloaded shared CI machine
+            CPU_PERCENT=15
+            MEMORY_LIMIT="256M"
+            MEMORY_HIGH="192M"
+            CPU_CORES="0"
+            NICE_LEVEL=19
+            STRESS_ENABLED=true
+            STRESS_LOAD=70
+            ;;
+        race)
+            # Optimized for exposing race conditions
+            # Injects delays at common sync points
+            CPU_PERCENT=30
+            MEMORY_LIMIT="512M"
+            CPU_CORES="0"
+            STRACE_INJECT="futex:50000"
+            ;;
+        race-io)
+            # Race conditions in I/O-heavy code
+            CPU_PERCENT=30
+            MEMORY_LIMIT="512M"
+            CPU_CORES="0"
+            STRACE_INJECT="open:100000"
+            ;;
+        race-net)
+            # Race conditions in network code
+            CPU_PERCENT=30
+            MEMORY_LIMIT="512M"
+            CPU_CORES="0"
+            STRACE_INJECT="connect:200000"
+            ;;
+        mem-pressure)
+            # Memory pressure / near-OOM conditions
+            CPU_PERCENT=50
+            MEMORY_LIMIT="64M"
+            MEMORY_HIGH="48M"
+            CPU_CORES="0"
+            ;;
+        potato)
+            # Absolute worst case - potato PC
+            CPU_PERCENT=2
+            MEMORY_LIMIT="64M"
+            MEMORY_HIGH="32M"
+            CPU_CORES="0"
+            NICE_LEVEL=19
+            IONICE_CLASS=3
+            USE_IDLE_SCHED=true
+            STRESS_ENABLED=true
+            STRESS_LOAD=90
+            ;;
+        flaky)
+            # For hunting flaky tests - moderate constraints + repeat
+            CPU_PERCENT=20
+            MEMORY_LIMIT="256M"
+            CPU_CORES="0"
+            REPEAT=50
+            ;;
+        *)
+            err "Unknown profile: $profile"
+            echo "Available profiles: slow, crawl, ci, race, race-io, race-net, mem-pressure, potato, flaky" >&2
+            exit 1
+            ;;
+    esac
+    
+    log "Applied profile: $profile"
+}
+
+list_profiles() {
+    cat <<EOF
+Available profiles:
+
+  slow          25% CPU, 256M RAM - budget CI runner
+  crawl          5% CPU, 128M RAM, SCHED_IDLE - ancient hardware
+  ci            15% CPU, 256M RAM + CPU contention - overloaded shared CI
+  race          30% CPU + futex delays - expose race conditions
+  race-io       30% CPU + open() delays - file I/O races
+  race-net      30% CPU + connect() delays - network races
+  mem-pressure  50% CPU, 64M/48M RAM - near-OOM conditions
+  potato         2% CPU, 64M RAM, contention - worst case scenario
+  flaky         20% CPU, 256M RAM, 50 repeats - hunt flaky tests
+
+Usage: sudo $SCRIPT_NAME --profile <name> -- <command>
+EOF
+    exit 0
+}
+
+# Internal state
+CGROUP_PATH=""
+STRESS_PIDS=()
+SCRIPT_NAME=$(basename "$0")
+
+# Detect original user (before sudo)
+if [[ -n "${SUDO_USER:-}" ]]; then
+    ORIGINAL_USER="$SUDO_USER"
+    ORIGINAL_UID=$(id -u "$SUDO_USER")
+    ORIGINAL_GID=$(id -g "$SUDO_USER")
+    ORIGINAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    ORIGINAL_USER="${USER:-$(whoami)}"
+    ORIGINAL_UID=$(id -u)
+    ORIGINAL_GID=$(id -g)
+    ORIGINAL_HOME="${HOME:-/tmp}"
+fi
+
+# Environment variables to pass through to child process
+declare -a ENV_PASSTHROUGH=()
+
+# ============================================================================
+# Functions
+# ============================================================================
+
+log() {
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "[slowlify] $*" >&2
+    fi
+}
+
+err() {
+    echo "[slowlify] ERROR: $*" >&2
+}
+
+usage() {
+    cat <<EOF
+Usage: sudo $SCRIPT_NAME [OPTIONS] -- <command> [args...]
+
+Simulate a slow/overloaded machine for reproducing CI failures.
+
+PROFILES (--profile NAME):
+  slow          Moderately slow, like a budget CI runner (25% CPU, 256M RAM)
+  crawl         Very slow, ancient hardware (5% CPU, 128M, SCHED_IDLE)
+  ci            Overloaded shared CI with CPU contention (15% CPU)
+  race          Expose race conditions via futex delays
+  race-io       Race conditions in file I/O (delays on open)
+  race-net      Race conditions in network code (delays on connect)
+  mem-pressure  Near-OOM memory pressure (64M hard, 48M soft limit)
+  potato        Absolute worst case - everything maxed out (2% CPU)
+  flaky         Hunt flaky tests - moderate constraints + 50 repeats
+
+CPU THROTTLING:
+  -c, --cpu PERCENT       CPU quota percentage, 1-100 [default: $CPU_PERCENT]
+  --cores CPUS            CPU cores to pin to, e.g., "0" or "0,1" [default: $CPU_CORES]
+  --idle                  Use SCHED_IDLE scheduler (runs only when system idle)
+
+MEMORY PRESSURE:
+  -m, --memory LIMIT      Hard memory limit, e.g., 128M, 1G [default: $MEMORY_LIMIT]
+  --memory-high LIMIT     Soft limit that triggers reclaim pressure
+
+I/O & PRIORITY:
+  --nice LEVEL            Nice level 0-19, higher=lower priority [default: $NICE_LEVEL]
+  --ionice CLASS          I/O class: 1=realtime, 2=best-effort, 3=idle [default: $IONICE_CLASS]
+
+ADVANCED:
+  --strace SPEC           Inject syscall delays via strace
+                          Format: syscall:delay_us or syscall:delay_us:when=N+M
+                          Examples: "open:100000" "read:50000:when=3+1"
+  --stress                Run background CPU load on pinned cores
+  --stress-load PCT       Background load percentage [default: $STRESS_LOAD]
+
+TESTING:
+  --repeat N              Run command N times [default: $REPEAT]
+  -e, --env VAR[=val]     Pass environment variable to command
+  -v, --verbose           Show what's being configured
+  -h, --help              Show this help
+
+MAINTENANCE:
+  --check-deps            Check all dependencies and system requirements
+  --cleanup               Remove any stale cgroups from crashed runs
+  --list-profiles         Show available profiles
+
+EXAMPLES:
+  # Use a preset profile
+  sudo $SCRIPT_NAME --profile ci -- ./my_test
+  sudo $SCRIPT_NAME --profile race -- ./concurrent_test
+  sudo $SCRIPT_NAME --profile potato -- make test
+
+  # Profile + override specific settings
+  sudo $SCRIPT_NAME --profile slow -c 10 -- ./my_test
+
+  # Hunt flaky tests
+  sudo $SCRIPT_NAME --profile flaky -- ./sometimes_fails
+
+  # Custom configuration
+  sudo $SCRIPT_NAME -c 5 -m 64M --stress -- ./my_test
+
+EOF
+    exit 0
+}
+
+cleanup() {
+    local exit_code=$?
+    log "Cleaning up..."
+
+    # Kill stress workers if running
+    for pid in "${STRESS_PIDS[@]}"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log "Stopping stress worker (PID $pid)"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+
+    # Wait for stress workers to exit
+    for pid in "${STRESS_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    
+    # Remove cgroup - must first move all processes out
+    if [[ -n "$CGROUP_PATH" ]] && [[ -d "$CGROUP_PATH" ]]; then
+        log "Removing cgroup: $CGROUP_PATH"
+        
+        # Move any remaining processes back to root cgroup
+        if [[ -f "$CGROUP_PATH/cgroup.procs" ]]; then
+            while read -r pid; do
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    log "Moving PID $pid out of cgroup"
+                    echo "$pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null || true
+                fi
+            done < "$CGROUP_PATH/cgroup.procs"
+        fi
+        
+        # Small delay to let kernel update
+        sleep 0.1
+        
+        # Now remove the cgroup
+        rmdir "$CGROUP_PATH" 2>/dev/null || {
+            log "Warning: Could not remove cgroup immediately, retrying..."
+            sleep 0.5
+            rmdir "$CGROUP_PATH" 2>/dev/null || \
+                log "Warning: Failed to remove $CGROUP_PATH - may need manual cleanup"
+        }
+    fi
+    
+    exit $exit_code
+}
+
+cleanup_stale_cgroups() {
+    # Clean up any orphaned slowrun cgroups from crashed runs
+    local stale_groups
+    stale_groups=$(find /sys/fs/cgroup -maxdepth 1 -name "slowlify_*" -type d 2>/dev/null || true)
+    
+    for cg in $stale_groups; do
+        # Check if it has any live processes
+        local has_procs=false
+        if [[ -f "$cg/cgroup.procs" ]]; then
+            while read -r pid; do
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    has_procs=true
+                    break
+                fi
+            done < "$cg/cgroup.procs"
+        fi
+        
+        if [[ "$has_procs" == "false" ]]; then
+            log "Cleaning up stale cgroup: $cg"
+            rmdir "$cg" 2>/dev/null || true
+        fi
+    done
+}
+
+parse_memory() {
+    local input="$1"
+    # Convert human-readable to bytes for validation, output as-is for cgroup
+    echo "$input"
+}
+
+check_cgroup_v2() {
+    if [[ ! -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        err "cgroups v2 not available. Ensure your system uses unified cgroup hierarchy."
+        err "You may need to boot with 'systemd.unified_cgroup_hierarchy=1'"
+        exit 1
+    fi
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        err "This script must be run as root (for cgroup manipulation)"
+        err "Usage: sudo $SCRIPT_NAME [OPTIONS] -- <command>"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local missing=()
+    local optional_missing=()
+    
+    # Required
+    if ! command -v taskset &>/dev/null; then
+        missing+=("util-linux")
+    fi
+    
+    if ! command -v nice &>/dev/null; then
+        missing+=("coreutils")
+    fi
+    
+    if ! command -v ionice &>/dev/null; then
+        missing+=("util-linux")
+    fi
+    
+    # Required for specific features
+    if [[ "$STRACE_INJECT" != "" ]] && ! command -v strace &>/dev/null; then
+        missing+=("strace")
+    fi
+    
+    if [[ "$USE_IDLE_SCHED" == "true" ]] && ! command -v chrt &>/dev/null; then
+        missing+=("util-linux")
+    fi
+    
+    # Optional but useful
+    if ! command -v getent &>/dev/null; then
+        optional_missing+=("libc-bin (getent)")
+    fi
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        err "Missing required dependencies: ${missing[*]}"
+        err "Install with: apt install ${missing[*]}"
+        return 1
+    fi
+    
+    if [[ ${#optional_missing[@]} -gt 0 ]]; then
+        log "Optional dependencies not found: ${optional_missing[*]}"
+    fi
+    
+    return 0
+}
+
+show_dependencies() {
+    echo "Checking dependencies for slowlify..."
+    echo ""
+    
+    local all_ok=true
+    
+    # Core requirements
+    echo "=== Required ==="
+    
+    check_cmd() {
+        local cmd="$1"
+        local pkg="$2"
+        local purpose="$3"
+        if command -v "$cmd" &>/dev/null; then
+            echo "  ✓ $cmd ($purpose)"
+        else
+            echo "  ✗ $cmd - MISSING (install: $pkg)"
+            all_ok=false
+        fi
+    }
+    
+    check_cmd taskset util-linux "CPU affinity"
+    check_cmd nice coreutils "process priority"
+    check_cmd ionice util-linux "I/O priority"
+    check_cmd chrt util-linux "scheduler class (SCHED_IDLE)"
+    check_cmd getent libc-bin "user lookup"
+    
+    echo ""
+    echo "=== Optional (for specific features) ==="
+    check_cmd strace strace "syscall delay injection (--strace)"
+    
+    echo ""
+    echo "=== System Requirements ==="
+    
+    # cgroups v2
+    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        echo "  ✓ cgroups v2 (unified hierarchy)"
+        
+        # Check available controllers
+        local controllers
+        controllers=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || echo "")
+        echo "    Available controllers: $controllers"
+        
+        if [[ "$controllers" != *"cpu"* ]]; then
+            echo "    ⚠ 'cpu' controller not available"
+        fi
+        if [[ "$controllers" != *"memory"* ]]; then
+            echo "    ⚠ 'memory' controller not available"
+        fi
+    else
+        echo "  ✗ cgroups v2 - NOT AVAILABLE"
+        echo "    Boot with: systemd.unified_cgroup_hierarchy=1"
+        all_ok=false
+    fi
+    
+    # Root check
+    if [[ $EUID -eq 0 ]]; then
+        echo "  ✓ Running as root"
+    else
+        echo "  ⚠ Not running as root (required for cgroup manipulation)"
+    fi
+    
+    echo ""
+    if [[ "$all_ok" == "true" ]]; then
+        echo "All dependencies satisfied!"
+        return 0
+    else
+        echo "Some dependencies are missing."
+        return 1
+    fi
+}
+
+setup_cgroup() {
+    local name
+    name="slowlify_$$_$(date +%s)"
+    CGROUP_PATH="/sys/fs/cgroup/$name"
+    
+    log "Creating cgroup: $CGROUP_PATH"
+    mkdir -p "$CGROUP_PATH"
+    
+    # Enable controllers
+    echo "+cpu +memory +io" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+    
+    # CPU quota: convert percentage to quota/period
+    # quota_us / period_us = percentage / 100
+    # Default period is 100000us (100ms)
+    local period=100000
+    local quota=$((CPU_PERCENT * period / 100))
+    
+    log "Setting CPU quota: ${quota}us / ${period}us (${CPU_PERCENT}%)"
+    echo "$quota $period" > "$CGROUP_PATH/cpu.max"
+    
+    # Memory limits
+    log "Setting memory limit: $MEMORY_LIMIT"
+    echo "$MEMORY_LIMIT" > "$CGROUP_PATH/memory.max"
+    
+    if [[ -n "$MEMORY_HIGH" ]]; then
+        log "Setting memory.high (soft limit): $MEMORY_HIGH"
+        echo "$MEMORY_HIGH" > "$CGROUP_PATH/memory.high"
+    fi
+    
+    # Disable swap for more predictable behavior (optional)
+    # echo "0" > "$CGROUP_PATH/memory.swap.max" 2>/dev/null || true
+}
+
+start_stress() {
+    if [[ "$STRESS_ENABLED" != "true" ]]; then
+        return
+    fi
+    
+    log "Starting background CPU load on cores $CPU_CORES at ${STRESS_LOAD}% target"
+    
+    # Simple bash-based CPU burner pinned to same cores as the test
+    # This creates contention on those specific cores only
+    (
+        while true; do
+            # Busy work for STRESS_LOAD% of time
+            local work_iters=$((STRESS_LOAD * 10000))
+            local x=0
+            while ((x < work_iters)); do
+                x=$((x + 1))
+            done
+            
+            # Sleep for remainder (approximate % of 100ms cycle)
+            local sleep_ms=$((100 - STRESS_LOAD))
+            sleep "0.${sleep_ms}s" 2>/dev/null || sleep 0.1
+        done
+    ) &
+    local burner_pid=$!
+    
+    # Pin the burner to same cores as the test
+    taskset -p -c "$CPU_CORES" "$burner_pid" >/dev/null 2>&1 || true
+    
+    STRESS_PIDS+=("$burner_pid")
+    
+    # Give it a moment to start
+    sleep 0.2
+}
+
+build_command() {
+    local cmd=()
+    
+    # CPU affinity
+    cmd+=(taskset -c "$CPU_CORES")
+    
+    # Nice level
+    cmd+=(nice -n "$NICE_LEVEL")
+    
+    # I/O priority
+    cmd+=(ionice -c "$IONICE_CLASS")
+    
+    # SCHED_IDLE scheduler
+    if [[ "$USE_IDLE_SCHED" == "true" ]]; then
+        cmd+=(chrt --idle 0)
+    fi
+    
+    # strace delay injection
+    if [[ -n "$STRACE_INJECT" ]]; then
+        local syscall delay when_clause=""
+        
+        # Parse format: syscall:delay[:when=N+M]
+        IFS=':' read -ra parts <<< "$STRACE_INJECT"
+        syscall="${parts[0]}"
+        delay="${parts[1]}"
+        
+        if [[ ${#parts[@]} -ge 3 ]]; then
+            when_clause=":${parts[2]}"
+        fi
+        
+        cmd+=(strace -o /dev/null -e "inject=${syscall}:delay_exit=${delay}${when_clause}")
+    fi
+    
+    echo "${cmd[@]}"
+}
+
+build_sudo_env() {
+    # Build environment variable arguments for sudo
+    local env_args=()
+    env_args+=("HOME=$ORIGINAL_HOME")
+    env_args+=("USER=$ORIGINAL_USER")
+    env_args+=("LOGNAME=$ORIGINAL_USER")
+    env_args+=("PATH=$PATH")
+    env_args+=("TERM=${TERM:-xterm}")
+    env_args+=("LANG=${LANG:-C.UTF-8}")
+    
+    # Add user-specified passthrough variables
+    for var in "${ENV_PASSTHROUGH[@]}"; do
+        if [[ "$var" == *=* ]]; then
+            env_args+=("$var")
+        elif [[ -n "${!var:-}" ]]; then
+            env_args+=("$var=${!var}")
+        fi
+    done
+    
+    echo "${env_args[@]}"
+}
+
+run_in_cgroup() {
+    local user_cmd=("$@")
+
+    # Move current shell into the cgroup
+    echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+    # Build the wrapped command (taskset, nice, ionice, etc.)
+    local wrapper
+    wrapper=$(build_command)
+
+    log "Executing: $wrapper ${user_cmd[*]}"
+    log "Running as user: $ORIGINAL_USER (UID $ORIGINAL_UID)"
+
+    # Build sudo environment
+    local sudo_env
+    sudo_env=$(build_sudo_env)
+
+    # Kill stress workers before exec since exec replaces this process
+    # and the cleanup trap would never run
+    for pid in "${STRESS_PIDS[@]}"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            log "Stopping stress worker before exec (PID $pid)"
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    # Wait for stress workers to actually terminate
+    for pid in "${STRESS_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # Run: wrapper commands need root, but target command runs as original user
+    exec $wrapper sudo -u "$ORIGINAL_USER" $sudo_env "${user_cmd[@]}"
+}
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -p|--profile)
+            PROFILE="$2"
+            apply_profile "$PROFILE"
+            shift 2
+            ;;
+        --list-profiles)
+            list_profiles
+            ;;
+        --cleanup)
+            check_root
+            echo "Cleaning up stale slowlify cgroups..." >&2
+            VERBOSE=true
+            cleanup_stale_cgroups
+            echo "Done." >&2
+            exit 0
+            ;;
+        --check-deps)
+            show_dependencies
+            exit $?
+            ;;
+        -c|--cpu)
+            CPU_PERCENT="$2"
+            shift 2
+            ;;
+        -m|--memory)
+            MEMORY_LIMIT="$2"
+            shift 2
+            ;;
+        --memory-high)
+            MEMORY_HIGH="$2"
+            shift 2
+            ;;
+        --cores)
+            CPU_CORES="$2"
+            shift 2
+            ;;
+        --nice)
+            NICE_LEVEL="$2"
+            shift 2
+            ;;
+        --ionice)
+            IONICE_CLASS="$2"
+            shift 2
+            ;;
+        --idle)
+            USE_IDLE_SCHED=true
+            shift
+            ;;
+        --strace)
+            STRACE_INJECT="$2"
+            shift 2
+            ;;
+        --stress)
+            STRESS_ENABLED=true
+            shift
+            ;;
+        --stress-load)
+            STRESS_LOAD="$2"
+            shift 2
+            ;;
+        --repeat)
+            REPEAT="$2"
+            shift 2
+            ;;
+        -e|--env)
+            ENV_PASSTHROUGH+=("$2")
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --)
+            shift
+            POSITIONAL+=("$@")
+            break
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# ============================================================================
+# Main
+# ============================================================================
+
+if [[ ${#POSITIONAL[@]} -eq 0 ]]; then
+    err "No command specified"
+    echo "Usage: sudo $SCRIPT_NAME [OPTIONS] -- <command> [args...]"
+    echo "Try '$SCRIPT_NAME --help' for more information."
+    exit 1
+fi
+
+check_root
+check_cgroup_v2
+if ! check_dependencies; then
+    exit 1
+fi
+
+# Clean up any stale cgroups from previous crashed runs
+cleanup_stale_cgroups
+
+trap cleanup EXIT INT TERM HUP
+
+setup_cgroup
+start_stress
+
+log "Original user: $ORIGINAL_USER (UID: $ORIGINAL_UID, GID: $ORIGINAL_GID)"
+log "Command will run as: $ORIGINAL_USER"
+
+# Print configuration summary
+if [[ "$VERBOSE" == "true" ]]; then
+    echo "============================================" >&2
+    echo "slowlify configuration:" >&2
+    [[ -n "$PROFILE" ]] && echo "  Profile:     $PROFILE" >&2
+    echo "  CPU:         ${CPU_PERCENT}% (cores: $CPU_CORES)" >&2
+    echo "  Memory:      $MEMORY_LIMIT (high: ${MEMORY_HIGH:-auto})" >&2
+    echo "  Nice:        $NICE_LEVEL, I/O class: $IONICE_CLASS" >&2
+    echo "  SCHED_IDLE:  $USE_IDLE_SCHED" >&2
+    echo "  strace:      ${STRACE_INJECT:-disabled}" >&2
+    echo "  stress-ng:   $STRESS_ENABLED (load: ${STRESS_LOAD}%)" >&2
+    echo "  Repeat:      $REPEAT" >&2
+    echo "  Command:     ${POSITIONAL[*]}" >&2
+    echo "============================================" >&2
+fi
+
+# Run the command (possibly multiple times)
+exit_code=0
+for ((i=1; i<=REPEAT; i++)); do
+    if [[ $REPEAT -gt 1 ]]; then
+        echo "[slowlify] Run $i/$REPEAT" >&2
+    fi
+    
+    # For repeat runs, we can't exec (need to continue loop)
+    if [[ $REPEAT -eq 1 ]]; then
+        run_in_cgroup "${POSITIONAL[@]}"
+    else
+        # Move into cgroup and run
+        echo $$ > "$CGROUP_PATH/cgroup.procs"
+        wrapper=$(build_command)
+        sudo_env=$(build_sudo_env)
+
+        # Run wrapper as root, command as original user
+        $wrapper sudo -u "$ORIGINAL_USER" $sudo_env "${POSITIONAL[@]}" || exit_code=$?
+
+        if [[ $exit_code -ne 0 ]]; then
+            echo "[slowlify] Command failed on run $i with exit code $exit_code" >&2
+            # Continue to see if it's flaky, or break here if you prefer
+        fi
+    fi
+done
+
+exit $exit_code

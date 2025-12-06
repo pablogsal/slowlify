@@ -1,0 +1,33 @@
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+*.tmp
+.bats/
+
+# Coverage reports
+coverage/
+*.lcov
+
+# Build artifacts (if any)
+dist/
+build/
+
+# Local configuration
+.env
+.env.local
+*.local
+
+# Backup files
+*.bak
+*.backup

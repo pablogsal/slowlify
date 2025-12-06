@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: ./tests/test_unit.sh
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BATS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+
+      - name: Check dependencies
+        run: sudo ./slowlify --check-deps
+
+      - name: Run integration tests
+        run: sudo bats tests/test_slowlify.bats
+
+  docs:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check README exists
+        run: test -f README.md
+
+      - name: Check LICENSE exists
+        run: test -f LICENSE
+
+      - name: Check help output matches docs
+        run: |
+          # Verify help shows expected sections
+          ./slowlify --help | grep -q "PROFILES"
+          ./slowlify --help | grep -q "CPU THROTTLING"
+          ./slowlify --help | grep -q "MEMORY PRESSURE"
